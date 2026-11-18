@@ -3,6 +3,7 @@
 #import "../../Runtime/Preferences.h"
 #import "../../UI/Assets.h"
 #import "../../UI/OverlayButtonHost.h"
+#import "../Downloads/DownloadLog.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <math.h>
@@ -162,7 +163,7 @@ static NSString *YTKACESpeedText(double rate) {
     return [NSString stringWithFormat:@"%.2fx", rate];
 }
 
-static UIImage *YTKACESpeedButtonImage(BOOL plus) {
+UIImage *YTKACESpeedButtonImage(BOOL plus) {
     CGSize size = CGSizeMake(22.0, 22.0);
     UIGraphicsBeginImageContextWithOptions(size, NO, 0.0);
     CGContextRef context = UIGraphicsGetCurrentContext();
@@ -181,6 +182,16 @@ static UIImage *YTKACESpeedButtonImage(BOOL plus) {
     return [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
+// System buttons crossfade title changes, which made fast +/- taps feel laggy.
+static void YTKACESetSpeedTitle(UIButton *button, NSString *title) {
+    if (button == nil || [title isEqualToString:[button titleForState:UIControlStateNormal]]) return;
+    [UIView performWithoutAnimation:^{
+        [button setTitle:title forState:UIControlStateNormal];
+        [button layoutIfNeeded];
+    }];
+    YTKACEOverlayButtonResized(button);
+}
+
 @interface YTKACESpeedCoordinator : NSObject
 + (instancetype)sharedCoordinator;
 @property(nonatomic, weak) UIView *overlay;
@@ -193,6 +204,8 @@ static UIImage *YTKACESpeedButtonImage(BOOL plus) {
 - (void)increase;
 - (void)reset;
 - (void)valueTapped:(UIButton *)sender;
+- (void)valueHeld:(UILongPressGestureRecognizer *)recognizer;
+- (BOOL)openSpeedMenuFrom:(UIButton *)sender;
 @end
 
 @implementation YTKACESpeedCoordinator
@@ -335,8 +348,7 @@ static UIImage *YTKACESpeedButtonImage(BOOL plus) {
         [NSUserDefaults.standardUserDefaults setFloat:(float)rate
                                                forKey:YTKACELastRateKey];
     }
-    [self.valueButton setTitle:YTKACESpeedText(rate)
-                      forState:UIControlStateNormal];
+    YTKACESetSpeedTitle(self.valueButton, YTKACESpeedText(rate));
 }
 
 - (id)eventsDelegate {
@@ -417,8 +429,7 @@ static UIImage *YTKACESpeedButtonImage(BOOL plus) {
                                                forKey:YTKACELastRateKey];
     }
     self.observedRate = rate;
-    [self.valueButton setTitle:YTKACESpeedText(rate)
-                      forState:UIControlStateNormal];
+    YTKACESetSpeedTitle(self.valueButton, YTKACESpeedText(rate));
 }
 
 - (void)decrease {
@@ -434,22 +445,39 @@ static UIImage *YTKACESpeedButtonImage(BOOL plus) {
 }
 
 - (void)valueTapped:(UIButton *)sender {
-    if (!YTKACESpeedMenuStyle()) {
+    if (!YTKACESpeedMenuStyle() || ![self openSpeedMenuFrom:sender]) {
         [self reset];
-        return;
     }
+}
+
+// Holding the number opens YouTube's speed menu in either style.
+- (void)valueHeld:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan) return;
+    UIButton *button = [recognizer.view isKindOfClass:UIButton.class] ? (UIButton *)recognizer.view : nil;
+    button.highlighted = NO;
+    [button cancelTrackingWithEvent:nil];
+    [[UIImpactFeedbackGenerator.alloc initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+    [self openSpeedMenuFrom:button];
+}
+
+- (BOOL)openSpeedMenuFrom:(UIButton *)sender {
     SEL open = NSSelectorFromString(@"didPressVarispeed:");
-    for (UIResponder *responder = self.overlay; responder != nil;
+    // start from the tapped button: the last laid out overlay can be another player's
+    for (UIResponder *responder = sender.window != nil ? (UIResponder *)sender : self.overlay; responder != nil;
          responder = responder.nextResponder) {
         if ([responder respondsToSelector:open]) {
             ((void (*)(id, SEL, id))objc_msgSend)(responder, open, sender);
-            return;
+            return YES;
         }
     }
-    [self reset];
+    return NO;
 }
 
 @end
+
+double YTKACECurrentPlaybackRate(void) {
+    return [YTKACESpeedCoordinator sharedCoordinator].currentRate;
+}
 
 static IMP YTKACEMaximumOriginal(id receiver, SEL selector) {
     NSString *key = [NSString stringWithFormat:@"%@|%@",
@@ -569,7 +597,21 @@ static double YTKACEHoldPreviousRate;
 static BOOL YTKACEHoldOverrideActive;
 static BOOL YTKACEHoldPillActive;
 
+// Holding for speed: other player gestures (swipe to seek) stay off.
+BOOL YTKACEHoldSpeedActive(void) {
+    return YTKACEHoldPillActive;
+}
+// Swiping up or down while holding changes the hold speed by 0.25x steps.
+static double YTKACEHoldCurrentRate;
+static CGFloat YTKACEHoldStartY;
+static __weak id YTKACEHoldPillNode;
+static NSDictionary *YTKACEHoldPillAttributes;
+static NSString *YTKACEHoldPillOriginalText;
+static IMP OriginalTextNodeSetAttributedText;
+static const CGFloat YTKACEHoldStepDistance = 30.0;
+
 static void YTKACERestoreHoldRate(void);
+static NSString *YTKACEWithPillMarks(NSString *original, NSString *speed);
 
 static void YTKACEApplyHoldRate(NSString *source) {
     const BOOL on = YTKACEFeatureEnabled(YTKACEHoldSpeedKey);
@@ -583,14 +625,39 @@ static void YTKACEApplyHoldRate(NSString *source) {
             (base >= 0.25 && base <= 5.0) ? base : 1.0;
         YTKACEHoldOverrideActive = YES;
     }
+    YTKACEHoldCurrentRate = stored;
     dispatch_async(dispatch_get_main_queue(), ^{
         [[YTKACESpeedCoordinator sharedCoordinator] setRate:stored];
     });
 }
 
+static void YTKACEHoldSwipeChanged(UILongPressGestureRecognizer *recognizer) {
+    if (!YTKACEHoldOverrideActive || YTKACEHoldCurrentRate <= 0.0 ||
+        !YTKACEFeatureEnabled(@"YTKACE.Preference.Player.HoldSpeedSwipe")) return;
+    const double stored = [YTKACEPreferenceObject(YTKACEHoldSpeedRateKey) doubleValue];
+    const CGFloat rise = YTKACEHoldStartY - [recognizer locationInView:recognizer.view].y;
+    const double steps = rise >= 0 ? floor(rise / YTKACEHoldStepDistance) : ceil(rise / YTKACEHoldStepDistance);
+    const double rate = MIN(5.0, MAX(0.25, stored + steps * 0.25));
+    if (fabs(rate - YTKACEHoldCurrentRate) < 0.001) return;
+    YTKACEHoldCurrentRate = rate;
+    [[UISelectionFeedbackGenerator new] selectionChanged];
+    [[YTKACESpeedCoordinator sharedCoordinator] setRate:rate];
+    id node = YTKACEHoldPillNode;
+    if (node != nil && OriginalTextNodeSetAttributedText != NULL) {
+        NSAttributedString *text = [[NSAttributedString alloc]
+            initWithString:YTKACEWithPillMarks(YTKACEHoldPillOriginalText ?: @"", YTKACESpeedText(rate))
+                attributes:YTKACEHoldPillAttributes ?: @{}];
+        ((void (*)(id, SEL, id))OriginalTextNodeSetAttributedText)(
+            node, NSSelectorFromString(@"setAttributedText:"), text);
+    }
+}
+
 static void YTKACERestoreHoldRate(void) {
     if (!YTKACEHoldOverrideActive) return;
     YTKACEHoldOverrideActive = NO;
+    YTKACEHoldCurrentRate = 0.0;
+    YTKACEHoldPillNode = nil;
+    YTKACEHoldPillOriginalText = nil;
     const double previous = YTKACEHoldPreviousRate;
     YTKACEHoldPreviousRate = 0.0;
     if (previous < 0.25 || previous > 5.0) return;
@@ -621,7 +688,12 @@ static void YTKACESpeedmasterLongPress(id receiver, SEL selector,
                                                               recognizer);
     }
     if (recognizer.state == UIGestureRecognizerStateBegan) {
+        YTKACEHoldStartY = [recognizer locationInView:recognizer.view].y;
         YTKACEApplyHoldRate(@"longpress");
+        return;
+    }
+    if (recognizer.state == UIGestureRecognizerStateChanged) {
+        YTKACEHoldSwipeChanged(recognizer);
         return;
     }
     if (recognizer.state == UIGestureRecognizerStateEnded ||
@@ -632,7 +704,29 @@ static void YTKACESpeedmasterLongPress(id receiver, SEL selector,
     }
 }
 
+// Right-to-left languages wrap the pill's "2x" in invisible direction marks.
+static NSCharacterSet *YTKACEBidiMarks(void) {
+    static NSCharacterSet *marks;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        marks = [NSCharacterSet characterSetWithCharactersInString:
+            @"\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\u061C"];
+    });
+    return marks;
+}
+
+// The same marks around a new speed text, so the pill keeps its direction.
+static NSString *YTKACEWithPillMarks(NSString *original, NSString *speed) {
+    NSCharacterSet *marks = YTKACEBidiMarks();
+    NSUInteger start = 0, end = original.length;
+    while (start < end && [marks characterIsMember:[original characterAtIndex:start]]) start++;
+    while (end > start && [marks characterIsMember:[original characterAtIndex:end - 1]]) end--;
+    return [NSString stringWithFormat:@"%@%@%@", [original substringToIndex:start], speed,
+                                      [original substringFromIndex:end]];
+}
+
 static BOOL YTKACELooksLikeSpeedPill(NSString *text) {
+    text = [text stringByTrimmingCharactersInSet:YTKACEBidiMarks()];
     if (text.length < 2 || ![text hasSuffix:@"x"]) return NO;
     NSString *number = [text substringToIndex:text.length - 1];
     NSCharacterSet *allowed =
@@ -640,21 +734,24 @@ static BOOL YTKACELooksLikeSpeedPill(NSString *text) {
     return [number stringByTrimmingCharactersInSet:allowed].length == 0;
 }
 
-static IMP OriginalTextNodeSetAttributedText;
-
 static void YTKACETextNodeSetAttributedText(id receiver, SEL selector,
                                             NSAttributedString *value) {
-    NSAttributedString *replacement = value;
+    value = YTKACEQueuePremiumText(value) ?: value;
+    NSAttributedString *replacement = YTKACEDislikeMetaText(receiver,
+        YTKACESubtitleWithoutProductCount(receiver, value));
     NSString *text = [value isKindOfClass:NSAttributedString.class]
         ? value.string : nil;
     if (text.length != 0 && YTKACEHoldPillActive &&
         YTKACEFeatureEnabled(YTKACEHoldSpeedKey) && YTKACELooksLikeSpeedPill(text)) {
-        const double stored =
+        const double stored = YTKACEHoldCurrentRate > 0.0 ? YTKACEHoldCurrentRate :
             [YTKACEPreferenceObject(YTKACEHoldSpeedRateKey) doubleValue];
-        NSString *wanted = YTKACESpeedText(stored);
+        NSString *wanted = YTKACEWithPillMarks(text, YTKACESpeedText(stored));
+        YTKACEHoldPillOriginalText = [text copy];
+        NSDictionary *attributes = value.length != 0
+            ? [value attributesAtIndex:0 effectiveRange:NULL] : @{};
+        YTKACEHoldPillNode = receiver;
+        YTKACEHoldPillAttributes = attributes;
         if (stored >= 0.25 && stored <= 5.0 && ![text isEqualToString:wanted]) {
-            NSDictionary *attributes = value.length != 0
-                ? [value attributesAtIndex:0 effectiveRange:NULL] : @{};
             replacement = [[NSAttributedString alloc] initWithString:wanted
                                                           attributes:attributes];
         }
@@ -665,7 +762,31 @@ static void YTKACETextNodeSetAttributedText(id receiver, SEL selector,
     }
 }
 
+// YouTube turns hold for speed off while the video is already at 2x. With a
+// custom hold speed that rule doesn't apply, so keep only its other checks.
+static IMP OriginalSpeedmasterEligible;
+
+static BOOL YTKACESpeedmasterEligible(id receiver, SEL selector) {
+    const BOOL eligible = ((BOOL (*)(id, SEL))OriginalSpeedmasterEligible)(receiver, selector);
+    if (eligible || !YTKACEFeatureEnabled(YTKACEHoldSpeedKey)) return eligible;
+    SEL videoDataSelector = NSSelectorFromString(@"videoData");
+    SEL videoTypeSelector = NSSelectorFromString(@"videoType");
+    SEL stateSelector = NSSelectorFromString(@"playerState");
+    Ivar videoIvar = class_getInstanceVariable(object_getClass(receiver), "_currentSingleVideoObservable");
+    id video = videoIvar != NULL ? object_getIvar(receiver, videoIvar) : nil;
+    if (![receiver respondsToSelector:stateSelector] || ![video respondsToSelector:videoDataSelector]) return NO;
+    id videoData = ((id (*)(id, SEL))objc_msgSend)(video, videoDataSelector);
+    if (![videoData respondsToSelector:videoTypeSelector]) return NO;
+    const long long videoType = ((long long (*)(id, SEL))objc_msgSend)(videoData, videoTypeSelector);
+    const long long state = ((long long (*)(id, SEL))objc_msgSend)(receiver, stateSelector);
+    YTKACEDebugLog(@"speed", @"hold eligible at 2x type=%lld state=%lld", videoType, state);
+    return videoType == 0 && state == 3;
+}
+
 static void YTKACEInstallHoldSpeedHooks(void) {
+    YTKACEInstallInstanceHook(
+        @"YTMainAppVideoPlayerOverlayViewController", @"currentVideoIsEligibleToActivateSpeedmaster",
+        (IMP)YTKACESpeedmasterEligible, &OriginalSpeedmasterEligible);
     const BOOL node = YTKACEInstallInstanceHook(
         @"ELMTextNode", @"setAttributedText:",
         (IMP)YTKACETextNodeSetAttributedText, &OriginalTextNodeSetAttributedText);
@@ -790,8 +911,17 @@ void YTKACEInstallSpeedHooks(void) {
         [minus setImage:YTKACESpeedButtonImage(NO) forState:UIControlStateNormal];
         [plus setImage:YTKACESpeedButtonImage(YES) forState:UIControlStateNormal];
         coordinator.valueButton = value;
-        [value setTitle:YTKACESpeedText(coordinator.currentRate)
-               forState:UIControlStateNormal];
+        YTKACESetSpeedTitle(value, YTKACESpeedText(coordinator.currentRate));
+        BOOL hasHold = NO;
+        for (UIGestureRecognizer *recognizer in value.gestureRecognizers) {
+            if ([recognizer isKindOfClass:UILongPressGestureRecognizer.class]) hasHold = YES;
+        }
+        if (!hasHold) {
+            UILongPressGestureRecognizer *hold = [[UILongPressGestureRecognizer alloc]
+                initWithTarget:coordinator action:@selector(valueHeld:)];
+            hold.minimumPressDuration = 0.4;
+            [value addGestureRecognizer:hold];
+        }
         [value setImage:nil forState:UIControlStateNormal];
         [value setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         value.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];

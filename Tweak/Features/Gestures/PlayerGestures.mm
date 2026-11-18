@@ -2,6 +2,7 @@
 #import "../../Runtime/Hooking.h"
 #import "../../Runtime/Preferences.h"
 #import "../../UI/Notice.h"
+#import "../Downloads/DownloadLog.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <MediaPlayer/MediaPlayer.h>
@@ -16,6 +17,7 @@ static const void *YTKACEGestureSurfaceAssociation =
     &YTKACEGestureSurfaceAssociation;
 static const void *YTKACELongPressAssociation = &YTKACELongPressAssociation;
 static const void *YTKACEGestureInitialAssociation = &YTKACEGestureInitialAssociation;
+static const void *YTKACETouchDownAssociation = &YTKACETouchDownAssociation;
 static const void *YTKACEGestureSecondaryInitialAssociation =
     &YTKACEGestureSecondaryInitialAssociation;
 static const void *YTKACEGestureActionAssociation = &YTKACEGestureActionAssociation;
@@ -25,9 +27,17 @@ static const void *YTKACEIndicatorTrackAssociation = &YTKACEIndicatorTrackAssoci
 static const void *YTKACEIndicatorFillAssociation = &YTKACEIndicatorFillAssociation;
 static const void *YTKACEIndicatorLabelAssociation = &YTKACEIndicatorLabelAssociation;
 static const void *YTKACEVolumeViewAssociation = &YTKACEVolumeViewAssociation;
+extern BOOL YTKACEHoldSpeedActive(void);
 static const void *YTKACESeekIndicatorAssociation = &YTKACESeekIndicatorAssociation;
 static const void *YTKACESeekIconAssociation = &YTKACESeekIconAssociation;
 static const void *YTKACESeekLabelAssociation = &YTKACESeekLabelAssociation;
+
+// The screen the player is on. On the iPhone Duo UIScreen.mainScreen is the
+// outer screen even while the app runs unfolded on the inner one, so setting
+// its brightness changed the screen that's off.
+static UIScreen *YTKACEScreenForView(UIView *view) {
+    return view.window.windowScene.screen ?: UIScreen.mainScreen;
+}
 
 @interface YTKACEPriorityPanGestureRecognizer : UIPanGestureRecognizer
 @end
@@ -51,6 +61,8 @@ static const void *YTKACESeekLabelAssociation = &YTKACESeekLabelAssociation;
 @property(nonatomic, weak) UIView *seekView;
 @property(nonatomic, assign) double seekTime;
 @property(nonatomic, assign) NSInteger seekDirection;
+@property(nonatomic, weak) id scrubOverlay;
+@property(nonatomic, weak) id scrubController;
 - (void)handleEdgePan:(UIPanGestureRecognizer *)recognizer;
 - (void)handleHold:(UILongPressGestureRecognizer *)recognizer;
 - (void)handleTwoFingerTap:(UITapGestureRecognizer *)recognizer;
@@ -235,6 +247,17 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     return YES;
 }
 
+// The pan only starts after the finger has moved a bit; remember where it
+// touched down so swipe to seek measures the whole travel.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if ([gestureRecognizer isKindOfClass:UIPanGestureRecognizer.class]) {
+        objc_setAssociatedObject(gestureRecognizer, YTKACETouchDownAssociation,
+            [NSValue valueWithCGPoint:[touch locationInView:gestureRecognizer.view]],
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return YES;
+}
+
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
     if (YTKACEFeatureEnabled(@"YTKACE.Preference.Gestures.LandscapeOnly")) {
         const CGSize screen = gestureRecognizer.view.window.bounds.size;
@@ -251,7 +274,20 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
         if (surface != 1) return NO;
         CGRect activeBounds = view.bounds;
         if (CGRectIsEmpty(activeBounds) || CGRectIsNull(activeBounds)) return NO;
-        if (fabs(velocity.y) <= fabs(velocity.x)) return NO;
+        if (fabs(velocity.y) <= fabs(velocity.x)) {
+            if (!YTKACEFeatureEnabled(@"YTKACE.Preference.Gestures.SwipeToSeek")) return NO;
+            if (YTKACEHoldSpeedActive()) return NO;
+            if ([self videoIsZoomedInView:view]) return NO;
+            // keep the progress bar's own scrubbing and the miniplayer's drag
+            if (location.y > CGRectGetHeight(activeBounds) * 0.75) return NO;
+            UIWindow *window = view.window;
+            if (window == nil ||
+                CGRectGetWidth([view convertRect:activeBounds toView:window]) <
+                    CGRectGetWidth(window.bounds) * 0.5) return NO;
+            objc_setAssociatedObject(gestureRecognizer, YTKACEGestureActionAssociation,
+                                     @4, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return YES;
+        }
         double storedArea = [YTKACEPreferenceObject(
             @"YTKACE.Preference.Gestures.ActivationArea") doubleValue];
         double areaPercent = storedArea > 0.0 ? storedArea : 20.0;
@@ -354,16 +390,214 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     [view bringSubviewToFront:indicator];
 }
 
+- (void)showSeekIndicatorInView:(UIView *)view time:(double)time forward:(BOOL)forward {
+    UIView *indicator = [self seekIndicatorInView:view];
+    YTKACEStyleGestureIndicator(indicator, 0.75, 12.0, 28.0);
+    UIImageView *icon = objc_getAssociatedObject(view, YTKACESeekIconAssociation);
+    UILabel *label = objc_getAssociatedObject(view, YTKACESeekLabelAssociation);
+    icon.image = [[UIImage systemImageNamed:forward ? @"goforward" : @"gobackward"]
+        imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    NSInteger seconds = MAX(0, (NSInteger)llround(time));
+    label.text = seconds >= 3600
+        ? [NSString stringWithFormat:@"%ld:%02ld:%02ld", (long)(seconds / 3600),
+              (long)(seconds / 60 % 60), (long)(seconds % 60)]
+        : [NSString stringWithFormat:@"%ld:%02ld", (long)(seconds / 60), (long)(seconds % 60)];
+    indicator.center = CGPointMake(CGRectGetMidX(view.bounds), CGRectGetMidY(view.bounds));
+    [view bringSubviewToFront:indicator];
+    [UIView animateWithDuration:0.2 animations:^{ indicator.alpha = 1.0; }];
+}
+
+- (void)seekTarget:(id)target toTime:(double)time {
+    SEL detailed = NSSelectorFromString(@"didSeekToTime:toleranceBefore:toleranceAfter:");
+    SEL simple = NSSelectorFromString(@"seekToTime:");
+    if ([target respondsToSelector:detailed]) {
+        ((void (*)(id, SEL, double, double, double))objc_msgSend)(target, detailed, time, 0.0, 0.0);
+    } else if ([target respondsToSelector:simple]) {
+        ((void (*)(id, SEL, double))objc_msgSend)(target, simple, time);
+    }
+}
+
+// Seconds a swipe across the whole video covers; 0 means the whole video.
+static double YTKACESwipeSeekRange(void) {
+    id stored = YTKACEPreferenceObject(@"YTKACE.Preference.Gestures.SwipeSeekRange");
+    return [stored respondsToSelector:@selector(doubleValue)] ? [stored doubleValue] : 90.0;
+}
+
+static UIView *YTKACEFindView(UIView *view, Class cls, NSUInteger depth) {
+    if (view == nil || depth > 12) return nil;
+    if ([view isKindOfClass:cls]) return view;
+    for (UIView *child in view.subviews) {
+        UIView *found = YTKACEFindView(child, cls, depth + 1);
+        if (found != nil) return found;
+    }
+    return nil;
+}
+
+// The player bar (YTInlinePlayerBarContainerView) owns the fine scrubber.
+// The overlay controller shows the storyboard preview over the video while
+// the progress bar is dragged; tell it about the swipe the same way.
+static id YTKACEScrubController(UIView *view) {
+    Class overlayClass = NSClassFromString(@"YTMainAppVideoPlayerOverlayViewController");
+    for (UIResponder *responder = view; responder != nil; responder = responder.nextResponder) {
+        if (overlayClass != Nil && [responder isKindOfClass:overlayClass]) return responder;
+    }
+    return nil;
+}
+
+// Dragging the bar grows its dot (2) and shrinks it back (1) after.
+static void YTKACEScrubDotScale(id bar, long long scale) {
+    SEL selector = NSSelectorFromString(@"setScrubberDotDecorationScale:");
+    if (![bar respondsToSelector:selector]) return;
+    [UIView animateWithDuration:0.2 animations:^{
+        ((void (*)(id, SEL, long long))objc_msgSend)(bar, selector, scale);
+    }];
+}
+
+static id YTKACEScrubberOverlay(UIView *view) {
+    Class overlayClass = NSClassFromString(@"YTMainAppVideoPlayerOverlayViewController");
+    Class barClass = NSClassFromString(@"YTInlinePlayerBarContainerView");
+    if (barClass == Nil) return nil;
+    for (UIResponder *responder = view; responder != nil; responder = responder.nextResponder) {
+        if (overlayClass != Nil && [responder isKindOfClass:overlayClass]) {
+            return YTKACEFindView(((UIViewController *)responder).viewIfLoaded, barClass, 0);
+        }
+    }
+    return YTKACEFindView(view, barClass, 0);
+}
+
+// Drives the player bar the way dragging the progress bar does, so YouTube's
+// own time pill and preview follow the finger. Ending the scrub only hides
+// them; the seek is ours.
+static BOOL YTKACEScrubberCanSeek(id bar) {
+    return [bar respondsToSelector:NSSelectorFromString(@"didStartScrubbing")] &&
+        [bar respondsToSelector:NSSelectorFromString(@"didScrubToPoint:withTime:")] &&
+        [bar respondsToSelector:NSSelectorFromString(@"didEndScrubbing")] &&
+        [bar respondsToSelector:NSSelectorFromString(@"scrubXForScrubRange:")];
+}
+
+static void YTKACEScrubBarToTime(id bar, double time, double total) {
+    const double fraction = total > 0.0 ? MIN(1.0, MAX(0.0, time / total)) : 0.0;
+    const double x = ((double (*)(id, SEL, double))objc_msgSend)(bar, NSSelectorFromString(@"scrubXForScrubRange:"), fraction);
+    ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(bar, NSSelectorFromString(@"didScrubToPoint:withTime:"),
+                                                        (CGPoint){x, 0.0}, time);
+}
+
+// A zoomed video pans with a horizontal drag, so swipe to seek stays out.
+- (BOOL)videoIsZoomedInView:(UIView *)view {
+    SEL zoom = NSSelectorFromString(@"videoZoomFactor");
+    SEL minimum = NSSelectorFromString(@"minFreeZoomFactor");
+    for (UIResponder *responder = view; responder != nil; responder = responder.nextResponder) {
+        id zoomController = nil;
+        SEL free = NSSelectorFromString(@"videoFreeZoomOverlayController");
+        if ([responder respondsToSelector:free]) {
+            zoomController = ((id (*)(id, SEL))objc_msgSend)(responder, free);
+        }
+        for (id candidate in @[responder, zoomController ?: NSNull.null]) {
+            if (candidate == NSNull.null || ![candidate respondsToSelector:zoom]) continue;
+            double factor = ((double (*)(id, SEL))objc_msgSend)(candidate, zoom);
+            double floor = [candidate respondsToSelector:minimum]
+                ? ((double (*)(id, SEL))objc_msgSend)(candidate, minimum) : 1.0;
+            return factor > MAX(1.0, floor) + 0.01;
+        }
+    }
+    return NO;
+}
+
+// Swipe left or right across the video. The target is always the start time
+// plus the finger's travel, so moving back returns exactly where you started.
+- (void)handleSwipeSeek:(UIPanGestureRecognizer *)recognizer {
+    UIView *view = recognizer.view;
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        self.seekTarget = [self seekResponderForView:view];
+        self.seekView = view;
+        id overlay = YTKACEScrubberOverlay(view);
+        self.scrubOverlay = YTKACEScrubberCanSeek(overlay) ? overlay : nil;
+        id controller = YTKACEScrubController(view);
+        self.scrubController = [controller respondsToSelector:NSSelectorFromString(@"didScrubPlayerBarToTime:")] ? controller : nil;
+        double start = round([self doubleFromResponder:self.seekTarget
+                                             selectors:@[@"currentVideoMediaTime", @"mediaTime"]]);
+        objc_setAssociatedObject(recognizer, YTKACEGestureInitialAssociation, @(start),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // The overlay first: starting its preview resets the bar, so the bar
+        // has to start after it to keep its dot and fill following the finger.
+        SEL startPreview = NSSelectorFromString(@"didStartPlayerBarScrubbingWithGestureOriginatingInPlayerBar:");
+        if ([self.scrubController respondsToSelector:startPreview]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self.scrubController, startPreview, YES);
+        }
+        if (self.scrubOverlay != nil) {
+            ((void (*)(id, SEL))objc_msgSend)(self.scrubOverlay, NSSelectorFromString(@"didStartScrubbing"));
+            YTKACEScrubDotScale(self.scrubOverlay, 2);
+        }
+    }
+    id target = self.seekTarget;
+    if (target == nil) return;
+    const double start = [objc_getAssociatedObject(recognizer, YTKACEGestureInitialAssociation) doubleValue];
+    NSValue *down = objc_getAssociatedObject(recognizer, YTKACETouchDownAssociation);
+    const CGFloat translation = down != nil
+        ? [recognizer locationInView:view].x - down.CGPointValue.x
+        : [recognizer translationInView:view].x;
+    const double maximum = [self doubleFromResponder:target selectors:@[
+        @"maximumSeekableTime", @"currentVideoTotalMediaTime", @"currentVideoTotalTime"]];
+    const double range = YTKACESwipeSeekRange() > 0.0 || maximum <= 0.0
+        ? MAX(10.0, YTKACESwipeSeekRange()) : maximum;
+    double time = start + translation / MAX(200.0, CGRectGetWidth(view.bounds)) * range;
+    time = MAX([self doubleFromResponder:target selectors:@[@"minimumSeekableTime"]], time);
+    if (maximum > 0.0) time = MIN(maximum - 1.0, time);
+    time = MAX(0.0, time);
+    id overlay = self.scrubOverlay;
+    if (recognizer.state == UIGestureRecognizerStateBegan ||
+        recognizer.state == UIGestureRecognizerStateChanged) {
+        if (self.scrubController != nil) {
+            ((void (*)(id, SEL, double))objc_msgSend)(self.scrubController,
+                NSSelectorFromString(@"didScrubPlayerBarToTime:"), time);
+        }
+        if (overlay != nil) {
+            YTKACEScrubBarToTime(overlay, time, maximum);
+        } else {
+            [self showSeekIndicatorInView:view time:time forward:translation >= 0.0];
+        }
+        return;
+    }
+    const BOOL seeks = recognizer.state == UIGestureRecognizerStateEnded && fabs(time - start) >= 1.0;
+    if (overlay != nil) {
+        if (!seeks) YTKACEScrubBarToTime(overlay, start, maximum);
+        ((void (*)(id, SEL))objc_msgSend)(overlay, NSSelectorFromString(@"didEndScrubbing"));
+        YTKACEScrubDotScale(overlay, 1);
+    } else {
+        UIView *indicator = [self seekIndicatorInView:view];
+        [UIView animateWithDuration:0.3 delay:0.3
+                            options:UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{ indicator.alpha = 0.0; } completion:nil];
+    }
+    SEL endPreview = NSSelectorFromString(@"didEndPlayerBarScrubbingWithGestureOriginatingInPlayerBar:withSeekCancelled:seekSource:");
+    if ([self.scrubController respondsToSelector:endPreview]) {
+        // Cancelled, so YouTube only hides the preview; the seek below is ours.
+        ((void (*)(id, SEL, BOOL, BOOL, int))objc_msgSend)(self.scrubController, endPreview, YES, YES, 0);
+    }
+    self.scrubController = nil;
+    if (seeks) [self seekTarget:target toTime:time];
+    YTKACEDebugLog(@"gestures", @"swipe seek %.0f -> %.0f scrubber=%d", start, time, overlay != nil);
+    self.seekTarget = nil;
+    self.seekView = nil;
+    self.scrubOverlay = nil;
+    objc_setAssociatedObject(recognizer, YTKACEGestureActionAssociation, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 - (void)handleEdgePan:(UIPanGestureRecognizer *)recognizer {
     UIView *view = recognizer.view;
     NSInteger action = [objc_getAssociatedObject(
         recognizer, YTKACEGestureActionAssociation) integerValue];
+    if (action == 4) {
+        [self handleSwipeSeek:recognizer];
+        return;
+    }
     BOOL volume = action == 2;
     BOOL both = action == 3;
     if (recognizer.state == UIGestureRecognizerStateBegan) {
         double start = volume
             ? AVAudioSession.sharedInstance.outputVolume
-            : UIScreen.mainScreen.brightness;
+            : YTKACEScreenForView(view).brightness;
         objc_setAssociatedObject(recognizer,
                                  YTKACEGestureInitialAssociation,
                                  @(start),
@@ -391,7 +625,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
             [slider setValue:(float)value animated:NO];
             [slider sendActionsForControlEvents:UIControlEventValueChanged];
         } else {
-            UIScreen.mainScreen.brightness = value;
+            YTKACEScreenForView(view).brightness = value;
             if (both) {
                 double volumeStart = [objc_getAssociatedObject(
                     recognizer, YTKACEGestureSecondaryInitialAssociation)
@@ -422,7 +656,25 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
         objc_setAssociatedObject(
             recognizer, YTKACEGestureSecondaryInitialAssociation,
             nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (volume || both) [self removeVolumeViewFromView:view];
     }
+}
+
+// A volume view on screen hides the system volume HUD, so only keep ours
+// around while the gesture is changing the volume.
+- (void)removeVolumeViewFromView:(UIView *)view {
+    __weak UIView *weakView = view;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *strong = weakView;
+        if (strong == nil) return;
+        for (UIGestureRecognizer *recognizer in strong.gestureRecognizers) {
+            if (recognizer.state == UIGestureRecognizerStateBegan ||
+                recognizer.state == UIGestureRecognizerStateChanged) return;
+        }
+        MPVolumeView *volumeView = objc_getAssociatedObject(strong, YTKACEVolumeViewAssociation);
+        [volumeView removeFromSuperview];
+        objc_setAssociatedObject(strong, YTKACEVolumeViewAssociation, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    });
 }
 
 - (double)seekStep {

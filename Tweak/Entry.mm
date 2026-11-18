@@ -25,6 +25,9 @@ static void YTKACEInstallModules(void) {
     YTKACEInstallBackgroundPlaybackHooks();
     YTKACEInstallSpeedHooks();
     YTKACEInstallLoopHooks();
+    YTKACEInstallQualityButtonHooks();
+    YTKACEInstallFullscreenHooks();
+    YTKACEInstallPreviousNextSeekHooks();
     YTKACEInstallSponsorMenu();
     YTKACEInstallLinkCleaningHooks();
     YTKACEInstallHapticHooks();
@@ -51,7 +54,11 @@ static void YTKACEInstallModules(void) {
     YTKACEInstallStreamingHooks();
     YTKACEInstallHLSPlaybackHooks();
     YTKACEInstallShortsHooks();
+    YTKACEInstallShortsFeedFilterHooks();
     YTKACEInstallTabBarHooks();
+    YTKACEInstallDuoTabBarHooks();
+    YTKACEInstallDuoDeskPlayerHooks();
+    YTKACEInstallDuoStatusBarHooks();
     YTKACEInstallNavigationBehaviorHooks();
     YTKACEInstallPlayerGestureHooks();
     YTKACEInstallOverlayVisibilityHooks();
@@ -62,6 +69,7 @@ static void YTKACEInstallModules(void) {
     YTKACEInstallProfilePictureHooks();
     YTKACEInstallPostImageSaverHooks();
     YTKACEInstallNativeShareHooks();
+    YTKACEInstallReturnDislikeHooks();
     YTKACEInstallSettingsEntryHooks();
     YTKACEInstallNativeSettingsHooks();
 }
